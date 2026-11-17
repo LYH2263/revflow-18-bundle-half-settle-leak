@@ -145,8 +145,8 @@ def _quarantine_one(
     run_id: int,
     now: str,
     bundle_key: str | None = None,
-) -> None:
-    conn.execute(
+) -> int:
+    cur = conn.execute(
         """
         INSERT INTO quarantine_items(
           entry_key, account_id, reason, amount_cents, settle_run_id, created_at, bundle_key
@@ -166,6 +166,7 @@ def _quarantine_one(
         "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
         (run_id, entry["id"]),
     )
+    return cur.lastrowid
 
 
 def _open_run(conn, now: str, scope: str, bundle_key: str | None) -> int:
@@ -177,6 +178,175 @@ def _open_run(conn, now: str, scope: str, bundle_key: str | None) -> int:
         (now, scope, bundle_key),
     )
     return cur.lastrowid
+
+
+def _snapshot_balances(conn) -> dict[int, int]:
+    """开跑时刻全部账户正式余额快照（证明「余额前」来源）。"""
+    return {
+        r["id"]: r["balance_cents"]
+        for r in conn.execute("SELECT id, balance_cents FROM accounts").fetchall()
+    }
+
+
+def _proof_balances(
+    opening: dict[int, int],
+    projected: dict[int, int],
+    account_ids,
+    bundle_delta: dict[int, int],
+) -> list[dict]:
+    """构造证明中的账户余额前后数组：前=开捆前余额，后=前+本捆增量。
+
+    失败捆 bundle_delta 恒为空（零落账），前后必然相等。
+    """
+    out = []
+    for acc_id in sorted(set(account_ids)):
+        before = projected.get(acc_id, opening.get(acc_id, 0))
+        delta = bundle_delta.get(acc_id, 0)
+        out.append(
+            {
+                "account_id": acc_id,
+                "balance_before_cents": before,
+                "delta_cents": delta,
+                "balance_after_cents": before + delta,
+            }
+        )
+    return out
+
+
+def _write_proof(
+    conn,
+    *,
+    run_id: int,
+    bundle: dict,
+    bucket: str,
+    member_keys: list[str],
+    outcomes: list[dict],
+    opening: dict[int, int],
+    projected: dict[int, int],
+    bundle_delta: dict[int, int],
+    fail_reason: str = "",
+) -> int:
+    account_ids = [o["account_id"] for o in outcomes]
+    return mln.insert_bundle_proof(
+        conn,
+        settle_run_id=run_id,
+        bundle_id=bundle["id"],
+        bundle_key=bundle["bundle_key"],
+        bucket=bucket,
+        member_keys=member_keys,
+        member_outcomes=outcomes,
+        account_balances=_proof_balances(opening, projected, account_ids, bundle_delta),
+        fail_reason=fail_reason,
+    )
+
+
+def _settle_bundle_success(
+    conn,
+    bundle: dict,
+    legs: list[dict],
+    run_id: int,
+    opening: dict[int, int],
+    projected: dict[int, int],
+    reserved: dict[str, int],
+    account_deltas: dict[int, int],
+) -> tuple[int, int]:
+    """整捆预检通过后才走到这里：全体写已归并、占用额度、累计正式余额增量，
+    落成功桶证明。返回 (成功捆数 1, 成员数)。"""
+    bundle_delta: dict[int, int] = {}
+    outcomes: list[dict] = []
+    for leg in legs:
+        reserved[leg["target_entry_key"]] = (
+            reserved.get(leg["target_entry_key"], 0) + leg["amount_cents"]
+        )
+        account_deltas[leg["account_id"]] = (
+            account_deltas.get(leg["account_id"], 0) - leg["amount_cents"]
+        )
+        bundle_delta[leg["account_id"]] = (
+            bundle_delta.get(leg["account_id"], 0) - leg["amount_cents"]
+        )
+        conn.execute(
+            "UPDATE ledger_entries SET status = '已归并', settle_run_id = ? WHERE id = ?",
+            (run_id, leg["id"]),
+        )
+        outcomes.append(
+            {
+                "entry_key": leg["entry_key"],
+                "account_id": leg["account_id"],
+                "amount_cents": leg["amount_cents"],
+                "outcome": mln.MEMBER_SETTLED,
+                "reason": "",
+            }
+        )
+    mln.mark_bundle_result(conn, bundle["id"], mln.BUNDLE_SETTLED, run_id)
+    member_keys = mln.load_bundle_member_keys(conn, bundle["id"])
+    _write_proof(
+        conn,
+        run_id=run_id,
+        bundle=bundle,
+        bucket=mln.PROOF_BUCKET_SUCCESS,
+        member_keys=member_keys,
+        outcomes=outcomes,
+        opening=opening,
+        projected=projected,
+        bundle_delta=bundle_delta,
+    )
+    for acc_id, delta in bundle_delta.items():
+        projected[acc_id] = projected.get(acc_id, opening.get(acc_id, 0)) + delta
+    return 1, len(legs)
+
+
+def _quarantine_bundle_failure(
+    conn,
+    bundle: dict,
+    legs: list[dict],
+    reasons: list[str],
+    run_id: int,
+    now: str,
+    opening: dict[int, int],
+    projected: dict[int, int],
+    override_reason: str | None = None,
+) -> tuple[int, int, int]:
+    """整桶进隔离（预检失败路径）：零落账。
+
+    全部成员写隔离项并共享同一捆扎键——坏腿写自身配平原因，好腿标「连带隔离」；
+    不占用原单额度、不产生任何余额增量；落失败桶证明。
+    返回 (失败捆数 1, 隔离成员数, 成员总数)。
+    """
+    outcomes: list[dict] = []
+    primary = override_reason or next((x for x in reasons if x), "整捆校验失败")
+    for leg, leg_reason in zip(legs, reasons):
+        reason = override_reason or (leg_reason or f"连带隔离：同捆存在失败腿（{primary}）")
+        _quarantine_one(conn, leg, reason, run_id, now, bundle["bundle_key"])
+        outcomes.append(
+            {
+                "entry_key": leg["entry_key"],
+                "account_id": leg["account_id"],
+                "amount_cents": leg["amount_cents"],
+                "outcome": (
+                    mln.MEMBER_QUARANTINED
+                    if (override_reason or leg_reason)
+                    else mln.MEMBER_QUARANTINED_CASCADE
+                ),
+                "reason": reason,
+            }
+        )
+    mln.mark_bundle_result(
+        conn, bundle["id"], mln.BUNDLE_QUARANTINED, run_id, fail_reason=primary
+    )
+    member_keys = mln.load_bundle_member_keys(conn, bundle["id"])
+    _write_proof(
+        conn,
+        run_id=run_id,
+        bundle=bundle,
+        bucket=mln.PROOF_BUCKET_FAILED,
+        member_keys=member_keys,
+        outcomes=outcomes,
+        opening=opening,
+        projected=projected,
+        bundle_delta={},
+        fail_reason=primary,
+    )
+    return 1, len(legs), len(member_keys)
 
 
 def _finish_run(conn, run_id: int, *, forward_count: int, reversal_count: int,
@@ -249,13 +419,18 @@ def _load_capacity(conn) -> tuple[dict[str, dict], dict[str, int]]:
 def run_settle() -> dict:
     """全量净额归并：散笔逐笔成败；待归捆按捆「全成或全进未平」。
 
-    成员状态、余额、隔离、捆状态全部在同一事务内提交，任一步抛错整体回滚，
-    不会出现先成功几笔再隔离其余却保留已改余额的半捆。
+    半捆收口采用「全捆预检」路径：捆内先纯预演可配平性，预检通过后才允许写
+    任何正式余额；预检失败零落账，成员全部进隔离并共享捆扎键，捆状态置
+    「整捆已隔离」。成员状态、余额、隔离、捆状态、分桶证明在同一事务提交，
+    任一步抛错整体回滚，不存在半捆改余额。
     """
     with connect() as conn:
         mln.ensure_schema(conn)
         now = _now()
         run_id = _open_run(conn, now, "散笔", None)
+        opening = _snapshot_balances(conn)
+        # 本运行内逐捆推演余额（仅用于证明快照，正式余额仍在提交点统一写）
+        projected = dict(opening)
 
         forwards = rows_to_dicts(
             conn.execute(
@@ -291,6 +466,8 @@ def run_settle() -> dict:
                 (run_id, f["id"]),
             )
             settled += 1
+        for acc_id, delta in account_deltas.items():
+            projected[acc_id] = projected.get(acc_id, opening.get(acc_id, 0)) + delta
 
         # 1) 散笔冲正：逐笔独立成败
         for r in reversals:
@@ -308,54 +485,41 @@ def run_settle() -> dict:
                 (run_id, r["id"]),
             )
             settled += 1
+            projected[r["account_id"]] = (
+                projected.get(r["account_id"], opening.get(r["account_id"], 0))
+                - r["amount_cents"]
+            )
 
-        # 2) 待归捆：整捆预演 → 全成整落，任一腿败则整捆隔离
+        # 2) 待归捆：全捆预检 → 通过才整捆落账；任一腿败则整捆隔离、零落账
         for item in mln.load_pending_bundles(conn):
             bundle = item["bundle"]
             legs = item["legs"]
-            bundle_members += len(legs)
-            if not legs:
-                # 防御：待归捆却无待归并成员（正常流程不会出现），不允许空捆过账
-                mln.mark_bundle_result(
-                    conn, bundle["id"], mln.BUNDLE_QUARANTINED, run_id,
-                    fail_reason="捆内无待归并成员，整捆拒绝过账",
+            snapshot_keys = mln.load_bundle_member_keys(conn, bundle["id"])
+            bundle_members += len(snapshot_keys)
+            if not legs or len(legs) != len(snapshot_keys):
+                # 防御：空捆或成员已非待归并（声明后成员快照不可变），整捆拒绝过账
+                reason = "捆内无待归并成员，整捆拒绝过账"
+                _, q_n, _ = _quarantine_bundle_failure(
+                    conn, bundle, legs, ["" for _ in legs], run_id, now,
+                    opening, projected, override_reason=reason,
                 )
+                quarantined += q_n
                 bundle_fail += 1
                 continue
             all_ok, reasons = mln.evaluate_bundle(legs, forwards_by_key, capacity, reserved)
             if all_ok:
-                for leg in legs:
-                    reserved[leg["target_entry_key"]] = (
-                        reserved.get(leg["target_entry_key"], 0) + leg["amount_cents"]
-                    )
-                    account_deltas[leg["account_id"]] = (
-                        account_deltas.get(leg["account_id"], 0) - leg["amount_cents"]
-                    )
-                    conn.execute(
-                        "UPDATE ledger_entries SET status = '已归并', settle_run_id = ? WHERE id = ?",
-                        (run_id, leg["id"]),
-                    )
-                mln.mark_bundle_result(conn, bundle["id"], mln.BUNDLE_SETTLED, run_id)
-                bundle_success += 1
-                continue
-
-            first_reason = next((x for x in reasons if x), "整捆校验失败")
-            for leg, leg_reason in zip(legs, reasons):
-                if not leg_reason:
-                    reserved[leg["target_entry_key"]] = (
-                        reserved.get(leg["target_entry_key"], 0) + leg["amount_cents"]
-                    )
-                    account_deltas[leg["account_id"]] = (
-                        account_deltas.get(leg["account_id"], 0) - leg["amount_cents"]
-                    )
-                    conn.execute(
-                        "UPDATE ledger_entries SET status = '已归并', settle_run_id = ? WHERE id = ?",
-                        (run_id, leg["id"]),
-                    )
-                else:
-                    _quarantine_one(conn, leg, leg_reason, run_id, now, bundle["bundle_key"])
-            mln.mark_bundle_result(conn, bundle["id"], mln.BUNDLE_SETTLED, run_id)
-            bundle_success += 1
+                s_n, m_n = _settle_bundle_success(
+                    conn, bundle, legs, run_id, opening, projected,
+                    reserved, account_deltas,
+                )
+                settled += m_n
+                bundle_success += s_n
+            else:
+                _, q_n, _ = _quarantine_bundle_failure(
+                    conn, bundle, legs, reasons, run_id, now, opening, projected
+                )
+                quarantined += q_n
+                bundle_fail += 1
 
         _finish_run(
             conn, run_id,
@@ -373,7 +537,11 @@ def run_settle() -> dict:
 
 
 def run_bundle_settle(bundle_key: str) -> dict:
-    """按捆归并：仅处理指定捆，整捆全成改余额，任一腿败整捆进隔离。单事务。"""
+    """按捆归并：仅处理指定捆。
+
+    全捆预检通过才整捆写正式余额；任一腿败则整捆零落账、成员全部进隔离
+    （好腿连带），捆状态置「整捆已隔离」。单事务，中途异常整体回滚。
+    """
     with connect() as conn:
         mln.ensure_schema(conn)
         bundle = mln.get_bundle(conn, bundle_key)
@@ -382,6 +550,8 @@ def run_bundle_settle(bundle_key: str) -> dict:
 
         now = _now()
         run_id = _open_run(conn, now, "按捆", bundle_key)
+        opening = _snapshot_balances(conn)
+        projected = dict(opening)
         forwards_by_key, capacity = _load_capacity(conn)
 
         leg_rows = conn.execute(
@@ -395,46 +565,31 @@ def run_bundle_settle(bundle_key: str) -> dict:
             (bundle["id"],),
         ).fetchall()
         legs = rows_to_dicts(leg_rows)
+        if not legs:
+            raise HTTPException(400, "捆内无成员，整捆拒绝处理")
         if any(leg["status"] != "待归并" for leg in legs):
             raise HTTPException(400, "捆内存在非待归并冲正，整捆拒绝处理")
 
         account_deltas: dict[int, int] = {}
+        # 按捆运行不带散笔上下文，占用基线为空
         all_ok, reasons = mln.evaluate_bundle(legs, forwards_by_key, capacity, {})
 
         if all_ok:
-            for leg in legs:
-                account_deltas[leg["account_id"]] = (
-                    account_deltas.get(leg["account_id"], 0) - leg["amount_cents"]
-                )
-                conn.execute(
-                    "UPDATE ledger_entries SET status = '已归并', settle_run_id = ? WHERE id = ?",
-                    (run_id, leg["id"]),
-                )
-            mln.mark_bundle_result(conn, bundle["id"], mln.BUNDLE_SETTLED, run_id)
-            settled = len(legs)
+            # 预检全过：此刻才允许写正式余额相关增量
+            bundle_success, m_n = _settle_bundle_success(
+                conn, bundle, legs, run_id, opening, projected,
+                reserved={}, account_deltas=account_deltas,
+            )
+            settled = m_n
             quarantined = 0
-            bundle_success = 1
             bundle_fail = 0
         else:
-            first_reason = next((x for x in reasons if x), "整捆校验失败")
+            # 预检失败：零落账。成员全部进隔离，好腿标连带，共享捆扎键
+            bundle_fail, quarantined, _ = _quarantine_bundle_failure(
+                conn, bundle, legs, reasons, run_id, now, opening, projected
+            )
             settled = 0
-            quarantined = 0
-            for leg, leg_reason in zip(legs, reasons):
-                if not leg_reason:
-                    account_deltas[leg["account_id"]] = (
-                        account_deltas.get(leg["account_id"], 0) - leg["amount_cents"]
-                    )
-                    conn.execute(
-                        "UPDATE ledger_entries SET status = '已归并', settle_run_id = ? WHERE id = ?",
-                        (run_id, leg["id"]),
-                    )
-                    settled += 1
-                else:
-                    _quarantine_one(conn, leg, leg_reason, run_id, now, bundle_key)
-                    quarantined += 1
-            mln.mark_bundle_result(conn, bundle["id"], mln.BUNDLE_SETTLED, run_id)
-            bundle_success = 1
-            bundle_fail = 0
+            bundle_success = 0
 
         _finish_run(
             conn, run_id,
@@ -471,7 +626,28 @@ def get_settle_run(run_id: int) -> dict:
                 (run_id,),
             ).fetchall()
         )
+        # 捆分桶证明（只读，与捆记录、流水、隔离、余额同源）
+        out["捆分桶证明"] = mln.list_bundle_proofs(conn, run_id)
         return out
+
+
+def list_run_bundle_proofs(run_id: int, bucket: str | None = None) -> list[dict]:
+    """按归并运行 id 只读查询捆分桶证明（成功/失败捆、成员键集合、余额前后）。"""
+    with connect() as conn:
+        mln.ensure_schema(conn)
+        exists = conn.execute(
+            "SELECT 1 FROM settle_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if not exists:
+            raise HTTPException(404, "归并运行不存在")
+        return mln.list_bundle_proofs(conn, run_id, bucket)
+
+
+def list_failed_bundle_proofs() -> list[dict]:
+    """只读列出全部失败捆证明（未平隔离界面按捆展示）。"""
+    with connect() as conn:
+        mln.ensure_schema(conn)
+        return mln.list_failed_bundle_proofs(conn)
 
 
 def run_verify(settle_run_id: int | None = None) -> dict:
@@ -539,6 +715,29 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "SELECT COUNT(*) AS c FROM reversal_bundles WHERE status = ?",
             (mln.BUNDLE_PENDING,),
         ).fetchone()["c"]
+        # 分桶证明与捆状态同源交叉核对：证明数应等于对应捆状态累计数
+        proof_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(bundle_settlement_proofs)")
+        }
+        if "bucket" in proof_cols:
+            run_proof_ok = conn.execute(
+                "SELECT COUNT(*) AS c FROM bundle_settlement_proofs WHERE settle_run_id = ? AND bucket = ?",
+                (settle_run_id, mln.PROOF_BUCKET_SUCCESS),
+            ).fetchone()["c"]
+            run_proof_fail = conn.execute(
+                "SELECT COUNT(*) AS c FROM bundle_settlement_proofs WHERE settle_run_id = ? AND bucket = ?",
+                (settle_run_id, mln.PROOF_BUCKET_FAILED),
+            ).fetchone()["c"]
+            total_proof_ok = conn.execute(
+                "SELECT COUNT(*) AS c FROM bundle_settlement_proofs WHERE bucket = ?",
+                (mln.PROOF_BUCKET_SUCCESS,),
+            ).fetchone()["c"]
+            total_proof_fail = conn.execute(
+                "SELECT COUNT(*) AS c FROM bundle_settlement_proofs WHERE bucket = ?",
+                (mln.PROOF_BUCKET_FAILED,),
+            ).fetchone()["c"]
+        else:
+            run_proof_ok = run_proof_fail = total_proof_ok = total_proof_fail = 0
 
         consistent = 1 if all_ledger_net == all_bal else 0
         detail = {
@@ -555,6 +754,10 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "累计成功捆数": total_bundle_success,
             "累计失败捆数": total_bundle_fail,
             "待归捆数": bundle_pending,
+            "本轮成功捆证明数": run_proof_ok,
+            "本轮失败捆证明数": run_proof_fail,
+            "累计成功捆证明数": total_proof_ok,
+            "累计失败捆证明数": total_proof_fail,
         }
         now = _now()
         cur = conn.execute(

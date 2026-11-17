@@ -5,6 +5,7 @@ import { getJson, postJson } from '../api'
 const runs = ref([])
 const bundles = ref([])
 const reversals = ref([])
+const proofs = ref([])
 const err = ref('')
 const msg = ref('')
 const busy = ref(false)
@@ -14,6 +15,7 @@ const busyKey = ref('')
 const bundleKey = ref('')
 const selectedKeys = ref([])
 const manualKeys = ref('')
+const proofRunId = ref(null)
 
 async function load() {
   const [r, b, e] = await Promise.all([
@@ -24,6 +26,17 @@ async function load() {
   runs.value = r
   bundles.value = b
   reversals.value = e
+  if (proofRunId.value) await loadProofs(proofRunId.value)
+}
+
+async function loadProofs(runId) {
+  proofRunId.value = runId
+  proofs.value = await getJson(`/api/settle-runs/${runId}/bundle-proofs`)
+}
+
+function clearProofs() {
+  proofRunId.value = null
+  proofs.value = []
 }
 
 const pendingReversals = computed(() =>
@@ -89,6 +102,7 @@ async function settleBundle(key) {
       msg.value = `捆 ${key} 整捆归并成功：${r.settled_count} 笔已归并并改余额`
     }
     await load()
+    await loadProofs(r.id)
   } catch (e) {
     err.value = String(e.message || e)
   } finally {
@@ -104,6 +118,7 @@ async function runSettle() {
     const r = await postJson('/api/settle-runs')
     msg.value = `归并完成 #${r.id}：净额 ${yuan(r.net_cents)}，隔离 ${r.quarantine_count}，成功捆 ${r.bundle_success_count}，失败捆 ${r.bundle_fail_count}`
     await load()
+    if (r.bundle_success_count + r.bundle_fail_count) await loadProofs(r.id)
   } catch (e) {
     err.value = String(e.message || e)
   } finally {
@@ -116,16 +131,28 @@ function statusTag(status) {
   if (status === '整捆已隔离') return 'bad'
   return 'warn'
 }
+
+function bucketTag(bucket) {
+  return bucket === '成功捆' ? 'on' : 'bad'
+}
+
+function outcomeTag(outcome) {
+  if (outcome === '已归并') return 'on'
+  if (outcome === '已隔离·连带') return 'warn'
+  return 'bad'
+}
 </script>
 
 <template>
   <div>
     <h1>归并台</h1>
     <p class="lead">
-      一批冲正可声明同一捆扎键：可配平的腿进入已归并并改余额，其余进隔离。
+      一批冲正可声明同一捆扎键，作为同一配平单元：全捆预检可配平才允许写正式余额；
+      任一腿失败则整捆零落账，成员全部进未平隔离（好腿连带）。
     </p>
     <p class="note-strip">
-      成员状态、余额、隔离、捆状态在同一事务内提交（失败闭）；捆扎集合落库于独立捆扎表，与散笔隔离。
+      成员状态、余额、隔离、捆状态、捆分桶证明在同一事务内提交（失败闭）；成员快照落库于独立捆扎表，
+      按捆扎键永远查得全成员，与散笔隔离。
     </p>
     <p v-if="msg" class="ok">{{ msg }}</p>
     <p v-if="err" class="msg">{{ err }}</p>
@@ -177,7 +204,7 @@ function statusTag(status) {
         <thead>
           <tr>
             <th>捆扎键</th><th>状态</th><th>成员笔数</th><th>成员冲正键</th>
-            <th>失败原因</th><th>归并#</th><th>操作</th>
+            <th>失败原因</th><th>归并#</th><th>分桶证明</th><th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -192,6 +219,14 @@ function statusTag(status) {
             <td>{{ b.settle_run_id || '—' }}</td>
             <td>
               <button
+                v-if="b.settle_run_id"
+                class="btn link-btn"
+                @click="loadProofs(b.settle_run_id)"
+              >查看证明</button>
+              <span v-else class="muted">—</span>
+            </td>
+            <td>
+              <button
                 v-if="b.status === '待归捆'"
                 class="btn secondary"
                 :disabled="busyKey === b.bundle_key"
@@ -200,12 +235,56 @@ function statusTag(status) {
               <span v-else class="muted">已处理</span>
             </td>
           </tr>
-          <tr v-if="!bundles.length"><td colspan="7">尚无捆扎</td></tr>
+          <tr v-if="!bundles.length"><td colspan="8">尚无捆扎</td></tr>
         </tbody>
       </table>
       <p v-if="pendingBundles.length" class="field-hint">
         待归捆 {{ pendingBundles.length }} 捆；也可用下方全量归并一次性处理全部散笔与待归捆。
       </p>
+    </div>
+
+    <div class="panel">
+      <h2>
+        捆分桶证明
+        <span v-if="proofRunId" class="muted">（归并运行 #{{ proofRunId }}，只读 · 与捆记录、流水、隔离、余额同源）</span>
+      </h2>
+      <div class="row-actions" style="margin-bottom:10px">
+        <button v-if="proofRunId" class="btn secondary" @click="clearProofs">关闭证明</button>
+        <span v-else class="muted">在上方捆记录或下方归并运行中点「查看证明」加载</span>
+      </div>
+      <table v-if="proofs.length">
+        <thead>
+          <tr>
+            <th>捆扎键</th><th>分桶</th><th>成员键集合（快照）</th><th>逐成员结果</th>
+            <th>账户余额前 → 后（元）</th><th>失败原因</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="p in proofs" :key="p.id">
+            <td>{{ p.bundle_key }}</td>
+            <td><span class="tag" :class="bucketTag(p.bucket)">{{ p.bucket }}</span></td>
+            <td class="mono-cell">
+              <span v-for="k in p.member_keys" :key="k" class="chip">{{ k }}</span>
+            </td>
+            <td class="mono-cell">
+              <div v-for="o in p.member_outcomes" :key="o.entry_key" class="outcome-line">
+                <span class="tag" :class="outcomeTag(o.outcome)">{{ o.outcome }}</span>
+                <strong>{{ o.entry_key }}</strong>
+                <span class="muted" v-if="o.reason">（{{ o.reason }}）</span>
+              </div>
+            </td>
+            <td class="mono-cell">
+              <div v-for="ab in p.account_balances" :key="ab.account_id" class="outcome-line">
+                账户{{ ab.account_id }}：{{ yuan(ab.balance_before_cents) }}
+                → {{ yuan(ab.balance_after_cents) }}
+                <span class="muted">（Δ {{ yuan(ab.delta_cents) }}）</span>
+              </div>
+            </td>
+            <td>{{ p.fail_reason || '—' }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else-if="proofRunId" class="muted">该运行无捆分桶证明（可能仅处理散笔）。</p>
     </div>
 
     <div class="panel">
@@ -218,6 +297,7 @@ function statusTag(status) {
           <tr>
             <th>#</th><th>范围</th><th>捆扎键</th><th>状态</th><th>已归并</th>
             <th>隔离</th><th>成捆/败捆</th><th>成员笔数</th><th>净额（元）</th><th>结束</th>
+            <th>分桶证明</th>
           </tr>
         </thead>
         <tbody>
@@ -232,8 +312,16 @@ function statusTag(status) {
             <td>{{ r.bundle_member_count }}</td>
             <td>{{ yuan(r.net_cents) }}</td>
             <td>{{ r.finished_at || '—' }}</td>
+            <td>
+              <button
+                v-if="r.bundle_success_count + r.bundle_fail_count"
+                class="btn link-btn"
+                @click="loadProofs(r.id)"
+              >查看证明</button>
+              <span v-else class="muted">—</span>
+            </td>
           </tr>
-          <tr v-if="!runs.length"><td colspan="10">尚无归并运行</td></tr>
+          <tr v-if="!runs.length"><td colspan="11">尚无归并运行</td></tr>
         </tbody>
       </table>
     </div>
@@ -283,5 +371,16 @@ function statusTag(status) {
 .muted {
   color: var(--muted);
   font-size: 12px;
+}
+.link-btn {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.outcome-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0;
+  white-space: nowrap;
 }
 </style>

@@ -3,17 +3,25 @@
 落库形态（二选一中的「独立捆扎表」）：
 - ``reversal_bundles``：捆扎身份与捆状态（待归捆/整捆已归并/整捆已隔离）；
 - ``reversal_bundle_members``：成员冲正键挂接，一笔冲正至多属于一捆。
+  成员行在声明后即不可变快照：归并引擎不改写、不删除成员，按捆扎键永远查得全成员。
 
 捆扎集合与散笔在落库层即可区分，不依赖请求体数组。
 隔离项（``quarantine_items.bundle_key``）与归并运行（``settle_runs.scope/bundle_key``）
 同样冗余捆扎键，保证捆扎记录、流水、隔离、余额、报告同源可查。
 
-失败闭由归并引擎以单事务保证（见 ``app.services.settle``）：同捆全部冲正
-可解析原单、账户一致且各自不超额，整捆才允许进入「已归并」并改余额；
-任一腿不满足则整捆进未平隔离、正式余额分毫不动。
+半捆收口（二选一中的「全捆预检」路径）：归并引擎先以 ``evaluate_bundle`` 纯预演
+整捆可配平性，**预检通过后才允许写任何正式余额**；预检失败则整捆零落账——成员
+全部进未平隔离（好腿标「连带隔离」），正式余额分毫不动，捆状态置「整捆已隔离」。
+禁止好腿留账、坏腿只改隔离。成员状态、余额、隔离、捆状态、捆分桶证明在同一
+SQLite 事务内提交，中途异常整体回滚。
+
+捆分桶证明（``bundle_settlement_proofs``，基线所无的新增实体）：每个归并运行处理
+过的每一捆留一行不可变证明，记录成功/失败分桶、完整成员键集合快照、逐成员结果、
+各账户余额前后值与失败原因，挂归并运行 id 提供只读查询。
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -25,6 +33,16 @@ BUNDLE_SETTLED = "整捆已归并"
 BUNDLE_QUARANTINED = "整捆已隔离"
 
 BUNDLE_STATUSES = (BUNDLE_PENDING, BUNDLE_SETTLED, BUNDLE_QUARANTINED)
+
+# ---- 捆分桶证明：成功桶 / 失败桶 ----
+PROOF_BUCKET_SUCCESS = "成功捆"
+PROOF_BUCKET_FAILED = "失败捆"
+PROOF_BUCKETS = (PROOF_BUCKET_SUCCESS, PROOF_BUCKET_FAILED)
+
+# 成员级结果（证明快照用）
+MEMBER_SETTLED = "已归并"
+MEMBER_QUARANTINED = "已隔离"
+MEMBER_QUARANTINED_CASCADE = "已隔离·连带"
 
 BUNDLE_DDL = """
 CREATE TABLE IF NOT EXISTS reversal_bundles (
@@ -44,6 +62,24 @@ CREATE TABLE IF NOT EXISTS reversal_bundle_members (
   seq INTEGER NOT NULL,
   UNIQUE(bundle_id, entry_key)
 );
+-- 捆分桶证明（基线所无的新增实体）：一捆一次归并一行，不可变，挂归并运行 id。
+-- 成员键集合、逐成员结果、账户余额前后均为落库时快照，事后不改写。
+CREATE TABLE IF NOT EXISTS bundle_settlement_proofs (
+  id INTEGER PRIMARY KEY,
+  settle_run_id INTEGER NOT NULL,
+  bundle_id INTEGER NOT NULL REFERENCES reversal_bundles(id),
+  bundle_key TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  member_keys_json TEXT NOT NULL,
+  member_outcomes_json TEXT NOT NULL,
+  account_balances_json TEXT NOT NULL,
+  fail_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bundle_proofs_run
+  ON bundle_settlement_proofs(settle_run_id);
+CREATE INDEX IF NOT EXISTS idx_bundle_proofs_bucket
+  ON bundle_settlement_proofs(settle_run_id, bucket);
 """
 
 # 既有表追加列（幂等迁移）
@@ -223,6 +259,110 @@ def mark_bundle_result(
         """,
         (status, settle_run_id, fail_reason, status, _now(), bundle_id),
     )
+
+
+def load_bundle_member_keys(conn: sqlite3.Connection, bundle_id: int) -> list[str]:
+    """不可变成员快照：按声明顺序返回该捆全部成员冲正键。
+
+    不按流水状态过滤——成员行一经声明即固定，保证落库后按捆扎键查得全成员。
+    """
+    rows = conn.execute(
+        """
+        SELECT entry_key FROM reversal_bundle_members
+        WHERE bundle_id = ?
+        ORDER BY seq
+        """,
+        (bundle_id,),
+    ).fetchall()
+    return [r["entry_key"] for r in rows]
+
+
+def insert_bundle_proof(
+    conn: sqlite3.Connection,
+    *,
+    settle_run_id: int,
+    bundle_id: int,
+    bundle_key: str,
+    bucket: str,
+    member_keys: list[str],
+    member_outcomes: list[dict],
+    account_balances: list[dict],
+    fail_reason: str = "",
+) -> int:
+    """写入一行捆分桶证明（不可变快照）。与归并事务同生共死。"""
+    if bucket not in PROOF_BUCKETS:
+        raise ValueError(f"未知捆分桶：{bucket}")
+    cur = conn.execute(
+        """
+        INSERT INTO bundle_settlement_proofs(
+          settle_run_id, bundle_id, bundle_key, bucket,
+          member_keys_json, member_outcomes_json, account_balances_json,
+          fail_reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            settle_run_id,
+            bundle_id,
+            bundle_key,
+            bucket,
+            json.dumps(member_keys, ensure_ascii=False),
+            json.dumps(member_outcomes, ensure_ascii=False),
+            json.dumps(account_balances, ensure_ascii=False),
+            fail_reason,
+            _now(),
+        ),
+    )
+    return cur.lastrowid
+
+
+def _row_to_proof(row: sqlite3.Row) -> dict:
+    proof = dict(row)
+    proof["member_keys"] = json.loads(proof.pop("member_keys_json"))
+    proof["member_outcomes"] = json.loads(proof.pop("member_outcomes_json"))
+    proof["account_balances"] = json.loads(proof.pop("account_balances_json"))
+    return proof
+
+
+def list_bundle_proofs(
+    conn: sqlite3.Connection,
+    settle_run_id: int,
+    bucket: str | None = None,
+) -> list[dict]:
+    """按归并运行 id 只读列出捆分桶证明；可再按成功/失败桶过滤。"""
+    if bucket is not None and bucket not in PROOF_BUCKETS:
+        raise HTTPException(400, f"未知捆分桶：{bucket}")
+    if bucket is not None:
+        rows = conn.execute(
+            """
+            SELECT * FROM bundle_settlement_proofs
+            WHERE settle_run_id = ? AND bucket = ?
+            ORDER BY id
+            """,
+            (settle_run_id, bucket),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM bundle_settlement_proofs
+            WHERE settle_run_id = ?
+            ORDER BY id
+            """,
+            (settle_run_id,),
+        ).fetchall()
+    return [_row_to_proof(r) for r in rows]
+
+
+def list_failed_bundle_proofs(conn: sqlite3.Connection) -> list[dict]:
+    """只读列出全部失败捆证明（未平隔离界面按捆展示用）。"""
+    rows = conn.execute(
+        """
+        SELECT * FROM bundle_settlement_proofs
+        WHERE bucket = ?
+        ORDER BY id DESC
+        """,
+        (PROOF_BUCKET_FAILED,),
+    ).fetchall()
+    return [_row_to_proof(r) for r in rows]
 
 
 # ---------------- 腿级配平校验（散笔 / 捆内共用） ----------------

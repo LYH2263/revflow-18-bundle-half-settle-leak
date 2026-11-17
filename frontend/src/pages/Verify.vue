@@ -60,7 +60,10 @@ function yuan(cents) {
         <div class="stat"><div class="k">累计成功捆</div><div class="v">{{ rows[0].detail.累计成功捆数 }}</div></div>
         <div class="stat"><div class="k">累计失败捆</div><div class="v">{{ rows[0].detail.累计失败捆数 }}</div></div>
         <div class="stat"><div class="k">待归捆</div><div class="v">{{ rows[0].detail.待归捆数 }}</div></div>
+        <div class="stat"><div class="k">成功捆证明</div><div class="v">{{ rows[0].detail.累计成功捆证明数 }}</div></div>
+        <div class="stat"><div class="k">失败捆证明</div><div class="v">{{ rows[0].detail.累计失败捆证明数 }}</div></div>
       </div>
+      <p class="note-strip">证明计数与捆状态累计同源：成功/失败捆各留一行不可变捆分桶证明（归并台、未平隔离可查成员集合与余额前后）。</p>
     </div>
 
     <div class="panel">
